@@ -1,0 +1,535 @@
+---
+title: "DEMS publications topic modelling"
+author: "Alessandro Asperti 813224, Sofia Davoli 813479"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, cache=TRUE)
+```
+
+# DEMS publications dataset
+
+
+```{r library, echo=FALSE, results='hide', message=F, warning=F}
+
+library(stringr)     # for working with strings
+library(SnowballC)   # for stopword list
+library(dplyr)       # data wrangling package
+library(tidytext)    # tidy text package
+library(ggplot2)     # good looing and smart plots
+library(tm)          # a (non tidy) text mining package
+library(topicmodels) # to run the Latent Dirichlet Allocatoin method
+library(ldatuning)   # contains metric for number of topic 
+library(tidyr)
+library(kohonen)     # implements self organizing maps
+library(heatmaply)   # to plot heatmap
+library(tidyverse)  # for data wrangling
+library(textmineR)
+
+#Let us load the packages we will need and the "list.xlsx" dataset with the publication of the DEMS.
+
+df_pub <- readxl::read_xlsx("list_20200522.xlsx", guess_max = 3800) # publications db
+```
+
+Dataset list_20200522 contains information about publication of DEMS Bicocca's departement till 2020. It contains 272 columns. Columns about title, authors, abstract and key words are of our interest. We will use this information to perform a topic modeling analysis. 
+
+```{r}
+dim(df_pub)
+```
+
+
+# PREPROCESSING
+
+Let us build a data frame (tibble object) merging publication title, keywords, abstract, journal name in one string. We want to keep also the publication ID and Scopus' subject classification.
+
+We also want to select records that contain only *journal articles* written in *English* and exclude those publications that do not have abstracts.
+
+```{r generate dataframe}
+df <- tibble(text = paste(df_pub$Titolo,
+                          df_pub$`Parole chiave`,
+                          df_pub$`Parole chiave inglese`,
+                          df_pub$Abstract,
+                          df_pub$`Abstract inglese`,
+                          df_pub$`rivista: denominazione`),
+             autori = df_pub$`contributors: Autori/curatori attualmente afferenti (elenco)`,
+             id = df_pub$`ID prodotto`) %>%
+      filter(!(is.na(df_pub$Abstract) & is.na(df_pub$`Abstract inglese`)),      # either abtract must exist
+             df_pub$`Lingua (codice)` == "eng",                                 # publications in English
+             df_pub$`Tipologia (collezione)` == "01 - Articolo su rivista") %>% # journal articles
+      unique()                                                                  # eliminate duplicated records
+
+knitr::kable(summary(df))
+```
+
+
+```{r , include = FALSE}
+any(is.na(df$text)) #No missing values in `text
+```
+
+Let us make a new data frame where:
+
+1. each word gets in a different row;
+2. stop words are deleted (stop words are very common words such as articles, function words, ...);
+3. characters that are not literals are eliminated;
+4. words stemming (finding the root of each word) using wordStem function
+
+```{r}
+td <- df %>%
+      unnest_tokens(output = "word", input = "text") %>%   # one word per row, no punctuation, lower case
+      anti_join(stop_words, by = "word") %>%               # eliminate stop-words
+      mutate(word = str_extract(word, "[a-z']+")) %>%      # eliminate non-letter character
+      mutate(word = wordStem(word, language = "eng"))      # words stemming
+
+knitr::kable(summary(td))
+```
+
+Notice that:
+
+1. `unnest_tokens` takes the string in the `input` filed and created a dataset with a row for each word in the field passed to the `output` argument;
+
+2. the `stop_words` tibble is contined in the *SnowballC* package and that `anti_join()` keeps the rows of the first dataset that are not in the second dataset (according to the field(s) indicated in the `by` argument);
+
+3. `str_extract()` extracts the substring compilant with the regular expression passed as second argument; the meaning of `[a-z']+` only letters from "a" to "z", the apostroph "'" that appear one or more ("+") times;
+
+4. the function `wordStem()` that carries out the stemming belongs to the `SnowballC` package.
+
+
+Let us count the words and order decreasingly.
+
+```{r}            
+word_cnt <- td %>% count(word, sort = TRUE)
+word_cnt <- word_cnt %>% mutate(perc = n / sum(n) * 100)
+knitr::kable(word_cnt%>%head(10))
+```
+
+We can notice that that there are many "na" strings and many missing values. It looks like at some points missing values have been cast into "na" strings. Let us eliminate both and recompute the tibbles.
+
+```{r}
+td <- td %>% filter(!is.na(word), word != "na")
+word_cnt <- td %>% count(word, sort = TRUE)
+word_cnt <- word_cnt %>% mutate(perc = n / sum(n) * 100)
+word_cnt %>% head(10) %>%
+  ggplot(aes(x = reorder(word, n), y = n)) + geom_col() + coord_flip() + ylab("")
+```
+
+We want to build a data frame with count per word per publication.
+
+```{r}
+word_cnt_art <- td %>% count(id, word, sort = TRUE)
+knitr::kable(word_cnt_art%>%head(10))
+```
+
+Since some words are very frequent in few documents (very discriminant for clustering) while others are present in many documents (not discriminant for clustering), a measure that try to compensate these extremes is the *tf-idf*, where *tf* stands for term frequency, while *idf* stands for inverse document frequancy and is computed as
+
+$$
+  idf = \log\left(\frac{\text{n. of documents}}{\text{n. of docs in which term is present}}\right)
+$$
+
+The *tf_idf* quantity is obtained as product of the document frequency times the *idf*. Let us use the *tidytext* function to add the *tf-idf* computations to the dataset.
+
+```{r}
+word_cnt_art <- word_cnt_art %>%
+                bind_tf_idf(term = word, document = id, n = n) %>%
+                arrange(desc(tf_idf))
+```
+
+Let us check how this quantity is distributed.
+
+```{r}
+summary(word_cnt_art$tf_idf)
+ggplot(word_cnt_art, aes(x = tf_idf)) + geom_density() + scale_x_log10()
+```
+
+Normally, for document clustering and topic modelling is carried out after exluding words with low *tf-idf*. The first quartile or even the median are possible cut-offs.
+Here median cut-off is applied.
+
+Now, let us build a document-term matrix to compute similarity measures between documents or apply the Latent Dirichlet Allocation method.
+
+We can use the `spread()` function in the *tidyr* package:
+
+```{r}
+# hand-made document-topic matrix
+mtr <- word_cnt_art %>%
+  filter(tf_idf > median(tf_idf)) %>% # select rows with tf_idf above the median
+  select(id, word, n) %>%
+  tidyr::spread(key = id, value = n, fill = 0)
+
+knitr::kable(mtr[1:5, 1:5])
+```
+
+This matrix is typically very sparse (with many zeros):
+
+
+```{r}
+mean(mtr > 0)
+```
+In fact, in this case we have less than 1% of non-zero values.
+
+A possible similarity matrix can be based on the product of the number of equivalent words in different documents. This measure can be cast into 0-1 as in the convertion of a covariance matrix into a correlation matrix. A distance can be built as $1 - \rho$, where $\rho$ is the correlation-like measure.
+
+```{r}
+cp1 <- crossprod(as.matrix(mtr[, -1])) %>% cov2cor()
+dst1 <- as.dist(1 - cp1)
+
+summary(dst1)
+```
+Most documents tend to be very distant from each other (at distance 1): they probably have no words in common. Maybe abstracts are a too short to be used in this context. Thus, we cannot expect a successful application of hierarchical clustering.
+
+However, the Latent Dirichlet Allocation method can be more succesfull. 
+The *topicmodels* package's `LDA()` function needs a document-term matrix in the format returned by the `tm` package. We can use the `cast_dtm()` function to build it.
+
+```{r}
+dtm <- word_cnt_art %>%
+  filter(tf_idf > median(tf_idf)) %>%
+  cast_dtm(term = word, document = id, value = n)
+
+dtm
+
+```
+
+The *textmineR* package's `FitLdaModel` function needs a document-term matrix of class dgCMatrix. We can use the `CreateDtm` function to build it.
+
+
+
+```{r}
+dtm_fit_LDA <- CreateDtm(doc_vec = df$text, # character vector of documents
+                 doc_names = df$id, # document names
+                 ngram_window = c(1,1), # minimum and maximum n-gram length
+                 stopword_vec = c(stopwords::stopwords("en"), # stopwords from tm
+                                  stopwords::stopwords(source = "smart"), NA, 'na'), # this is the default value
+                 lower = TRUE, # lowercase - this is the default value
+                 remove_punctuation = TRUE, # punctuation - this is the default
+                 remove_numbers = TRUE, # numbers - this is the default
+                 verbose = FALSE, # Turn off status bar for this demo
+                 cpus = 2) # default is all available cpus on the system
+
+
+
+```
+
+
+
+# CHOOSING NUMBER OF TOPIC
+
+
+Once the document-term matrix is been created and the LDA applied, we need to choose k number of topics.
+
+Although there is no single, uniform measure for choosing the number of topics in building a topic model, several methods have been proposed to help decide on the number of topics k. 
+
+Two methods (Coa Juan and Arun) aim to minimize the metrics to determine the optimal number of topics. Both Coa Juan and Arun use measures of distance to make decisions regarding k. The other two methods (Deveau and Griffiths) aim to maximize the metrics to determine the optimal number of topics.
+
+ - Cao Juan 2009 uses minimum density measures to choose the number of topics. 
+
+ - Arun 2010 utilize a measure of divergence, where minimal divergence within a topic is preferred.
+
+ - Deveaud 2014 utilize a measure maximizing the divergence across topics.
+
+ - Griffiths2004 maximize the log-likelihood of the data over different value of k.
+
+We use these four measures across 2-15 topics.
+ 
+
+```{r}
+result <- FindTopicsNumber(
+  dtm,
+  topics = seq(from = 2, to = 15, by = 1),
+  metrics = c("Griffiths2004", "CaoJuan2009", "Arun2010", "Deveaud2014"),
+  method = "Gibbs",
+  control = list(seed = 77),
+  mc.cores = 2L,
+  verbose = TRUE
+)
+```
+
+```{r}
+FindTopicsNumber_plot(result)
+
+```
+The Plot show that the optimal number of topic is 6 (in both cases the 2 lines intersect at 6).
+
+Once the optimal number of topic is found, there's the need of human intuition to decide wether the optimal number of topics is sufficent to create topics.
+
+## Assessing number of topics
+
+We used 2 different LDA model estimator:
+- LDA function which implements VEM algorithm. This typeof object allows us to compute the per-document-per-topic probability.
+
+- FitLdaModel function which implements Gibbs sampling algorithm. This function contains a parameter that allows us to compute topic coherence. 
+We use both model to assess number of topic.
+
+
+```{r LDA_6_topic}
+lda6 <- LDA(dtm, 6,control=list(seed=122))
+top6 <- topics(lda6)
+ter6 <- terms(lda6, 10) # 10 most frequent words for each topic
+table(top6)
+knitr::kable(ter6)
+```
+
+
+
+
+```{r Fit_LDA_6_topic}
+
+model_6 <- FitLdaModel(dtm = dtm_fit_LDA, 
+                     k = 6,
+                     iterations = 500, 
+                     calc_likelihood = TRUE,
+                     calc_coherence = TRUE,
+                     calc_r2 = TRUE,
+                     seed=222) 
+
+model_6$coherence
+model_6$top_terms <- GetTopTerms(phi = model_6$phi, M = 10)
+knitr::kable(model_6$top_terms)
+```
+
+From both model's top 10 word per topic it is difficult to define the topic.
+We think that 6 topic are not enough to select the definition of the same.
+
+So we try to apply the LDA with 7 topics.
+
+```{r}
+lda7 <- LDA(dtm, 7, control=list(seed=0))
+top7 <- topics(lda7)
+ter7 <- terms(lda7,10) # 10 most frequent words for each topic
+table(top7)
+knitr::kable(ter7)
+```
+
+
+We obtain the following topic:
+topic 1 = statistic
+topic 2 = health
+topic 3 = political economy
+topic 4 = mathematical economics
+topic 5 = labour economics
+topic 6 = industrial economics
+topic 7 = energy
+
+
+```{r}
+
+model_7<- FitLdaModel(dtm = dtm_fit_LDA, 
+                     k = 7,
+                     iterations = 500, 
+                     calc_likelihood = TRUE,
+                     calc_coherence = TRUE,
+                     calc_r2 = TRUE,
+                     seed=14) 
+
+
+model_7$top_terms <- GetTopTerms(phi = model_7$phi, M = 10)
+knitr::kable(model_7$top_terms)
+```
+
+Both models used to fit LDA with 7 topic gave as resulting top 10 word which distingue better the 7 topic. Topics defined using topicmodel package reappear in textmieR result, in fact top 10 words for topic are almost the same for the 2 models. we can compute coherence of topic, thaks to textmineR package and assume that this results can be considered as significant also for the other model.
+
+```{r}
+model_7$coherence
+```
+
+Obtained result suggest that the 7 topic are not really coherent. 
+We try to evaluate the topics using human judgement technique (we compute the per-document-per-topic probabilities and than we analyze the texts) .
+
+
+
+# GAMMA PROBABILITY
+
+We can examine the per-document-per-topic probabilities, called  gamma, with the matrix = "gamma" argument to tidy().
+
+```{r}
+ap_documents <- tidy(lda7, matrix = "gamma") #gamma probabilities of each topic
+knitr::kable(ap_documents%>%head(20))
+```
+
+Each of these values (gamma) is an estimated proportion of words from that document that are generated from that topic. For example, the model estimates that about 99,31% of the words in document  139303 were generated from topic 1. To confirm this result, we checked what the most common words in document  139303 were:
+
+```{r }
+tidy(dtm) %>%
+  filter(document == 139303) %>%
+  arrange(desc(count))
+```
+This appears to be an article about statistic.  Which means that the algorithm was right to place this document in topic 1.
+
+
+# KOHONEN MAP
+
+Kohonen map or SOM(Self Organizing Map) is a method to do dimensionality reduction. They use a neighborhood function to preserve the topological properties of the input space. This makes SOMs useful for visualization and for understanding patterns and caractherists like correlations between topics and data.
+
+
+
+```{r}
+#To create kohonen map we need to do some manipulation to the dataset.
+data_wide <- spread(ap_documents, topic, gamma) #horizontalize df
+data_wide <- rename(data_wide,"topic_1"="1","topic_2"="2","topic_3"="3","topic_4"="4","topic_5"="5","topic_6"="6","topic_7"="7")
+data_wide<-data_wide%>%mutate(Sum = select(., topic_1:topic_7) %>% rowSums(na.rm = TRUE)) #check if probabilities sum to 1
+head(data_wide)
+```
+
+We created 2 SOM model, one with 500 iterations and one with 1000 iterations to check which one convergence.
+
+```{r}
+data_train_matrix <- as.matrix(scale(data_wide[,c(-1,-9)]))
+
+som_grid <- somgrid(xdim = 10, ydim=10, topo="hexagonal")# set map grid
+
+
+
+som_model500 <- som(data_train_matrix, 
+    grid=som_grid,
+    rlen=500,
+    alpha=c(0.05,0.01), 
+    keep.data = TRUE )
+
+som_model1000 <- som(data_train_matrix, 
+    grid=som_grid,
+    rlen=1000,
+    alpha=c(0.05,0.01), 
+    keep.data = TRUE )
+
+
+
+```
+
+## Changing Line: Progression of the learning process. 
+
+This graph enables to appreciate the convergence of the algorithm. It shows the evolution of the average distance to the nearest cells in the map. 
+If there appear a fast decreasing, the number of iteration can be minimized. By default, the procedure requests RLEN = 100 iterations.
+
+```{r}
+plot(som_model500, type='changes', main = "training process of som_500")
+plot(som_model1000, type='changes', main = "training process of som_1000")
+```
+
+
+For our dataset we have a slow decreasing but it converge to zero. It means that we need at least 500 iterations. 
+We check if with 1000 iterations we can have a faster convergence, but this doesn't happen.
+
+
+
+## Codes Book: distribution of argument in the plot
+
+This type of chart allows to establish the role of variables in the definition of the different areas that comprise the topological map. This is important for the interpretation of the results. 
+This chart represents the vector of weights in a pie chart for each cell of the map. 
+
+```{r}
+plot(som_model500, type='codes', palette.name= rainbow, main="Codes Book")
+```
+
+We note that the topics are well distinguished, and that in the center of the map we can found the mixed-topic document that are those characterized by 2 or more different topics.
+
+
+## Count Plot
+
+Count plot show how many artcles are in each part of kohonen map, we wish to have all the part filled up.
+We can then identify high-density areas.
+Ideally, the distribution should be homogeneous. The size of the map should be reduced if
+there are many empty cells. Conversely, we must increase it if areas of very high density
+appear.
+
+```{r}
+par(mfrow = c(1, 2))
+plot(som_model500, type='count')
+plot(som_model500, type='mapping')
+```
+
+In this case we only have 4/100 empty point so we decide that the dimension is fine.
+
+
+## Neighbour distance plot
+
+Neighbour distance plot. Called "U-Matrix" (unified distance matrix), it represents a selforganizing map (SOM) where the Euclidean distance between the codebook vectors of neighboring neurons is depicted in a range of colors.
+According to the package documentation, the nodes that form the same group tend to be
+close. Border areas are bounded by nodes that are far from each other.
+```{r}
+plot(som_model500, type='dist.neighbours')
+```
+
+In our chart , the nodes which are close to the others are red-colored. We observe that we have an ovest part in which documents seems to be more distanced.
+
+## Kohonen map fot each topic
+
+Rather than making a single chart for all
+the variables, we can make a graph for each variable, trying to highlight the contrasts
+between the high and low value areas. This univariate description is easier to understand.
+
+
+```{r}
+par(mfrow = c(4, 2))
+plot(som_model500, type = "property", property = getCodes(som_model500)[,1], main="topic 1: statistic")
+plot(som_model500, type = "property", property = getCodes(som_model500)[,2], main="topic 2: health")
+plot(som_model500, type = "property", property = getCodes(som_model500)[,3], main="topic 3: political economy")
+plot(som_model500, type = "property", property = getCodes(som_model500)[,4], main="topic 4: mathematical economics")
+plot(som_model500, type = "property", property = getCodes(som_model500)[,5], main="topic 5: labour economics")
+plot(som_model500, type = "property", property = getCodes(som_model500)[,6], main="topic 6: industrial economics")
+plot(som_model500, type = "property", property = getCodes(som_model500)[,7], main="topic 7: energy")
+
+```
+
+
+# GENERAING DATASET FOR VISUALIZATION ON TABLEAU
+
+Since package Kohonen doesn't allow to create an interactive visualization we need to extract from the som_model some information about coordinates of each point.
+
+```{r ,include=FALSE}
+som_dist <- som_model500[[4]]$pts %>%
+  as_tibble %>% 
+  mutate(id=row_number())
+
+som_pts<- tibble(id=som_model500[[2]],
+                 dist=som_model500[[3]],
+                 type=data_wide$document)
+som_pts <- som_pts %>% left_join(som_dist,by="id")
+head(som_pts)
+
+```
+
+We then need to attach information about topic type for each document. (choosing topic with higher gamma probabilities)
+
+```{r ,include=FALSE}
+data_wide<-data_wide %>%
+  mutate(topic=apply(.[,2:8], 1, function(x) names(x)[which.max(x)]))  
+table(data_wide$topic)
+
+som_pts<-som_pts %>% 
+  rename(
+    document=type
+        )
+#join on som_pts type e data_wide id
+som_pts2<-merge(som_pts, data_wide[,c("topic", "document")], by="document")
+```
+
+We use as distances jittered values to better separate values.
+
+```{r ,include=FALSE}
+jitterx=jitter(som_pts2$x)
+jittery=jitter(som_pts2$y)
+som_pts2$jitter_x=jitterx
+som_pts2$jitter_y=jittery
+
+```
+
+
+This plot is a traslated version of kohonen map on ggplot. This show what we'll obtain in tableau. 
+```{r}
+ggplot(data=som_pts, aes(x0=x, y0=y, col=factor(som_pts2[,"topic"])))+
+  geom_jitter(data=som_pts, aes(x,y, alpha=0.2), position = position_jitter(seed=1))
+```
+
+
+Tableau visualization is available at the following link:
+https://public.tableau.com/profile/alessandro5441#!/vizhome/DocumentsandAuthorsmapping-LDA_16122629406460/Foglio1?publish=yes
+
+
+# CONCLUSIONS
+
+Topic modeling analysis performed did not have excellent results in terms of consistency of the topics identified, however based on our judgment the classification seems correct. 
+The advantage of this model is that is really fast, in fact LDA takes few seconds to run on almost a 1000 abstract. 
+The negative aspect is that it does not take in account the semantic. 
+Future developement could take in account also this aspect to obtain more specifc results.
+
+
